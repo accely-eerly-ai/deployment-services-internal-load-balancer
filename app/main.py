@@ -28,11 +28,13 @@ Example config file (azure_instances.json)
     { "endpoint": "https://westus-xyz.openai.azure.com", "api_key": "YYYY" },
     { "endpoint": "https://swedencentral-abc.openai.azure.com", "api_key": "ZZZZ" }
   ],
-  "header_name": "api-key"
+  "header_name": "api-key",            // header name used when talking to upstream
+  "client_header_name": "api-key",     // header to read from inbound client (defaults to "api-key")
+  "client_keys": ["my-key-1","my-key-2"] // optional allowlist of client keys
 }
 """
 
-# ---------- Load credentials from JSON ----------
+# ---------- Load credentials + client auth from JSON ----------
 def _load_config(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -60,13 +62,24 @@ def _load_config(path: str):
             creds.append(pair)
             seen.add(pair)
 
-    return creds, header_name
+    # Inbound auth config
+    client_header_name = (data.get("client_header_name") or "api-key").strip().lower()
+    client_keys_cfg = data.get("client_keys") or []
+    if not isinstance(client_keys_cfg, list):
+        raise RuntimeError("'client_keys' must be a list when provided.")
 
-CREDENTIALS, HEADER_NAME = _load_config(CONFIG_PATH)
+    # Allow env var to supply/augment keys (comma-separated)
+    env_keys = [s.strip() for s in os.getenv("AZURE_PROXY_CLIENT_KEYS", "").split(",") if s.strip()]
+    client_keys = set(client_keys_cfg) | set(env_keys)
+
+    return creds, header_name, client_header_name, client_keys
+
+CREDENTIALS, HEADER_NAME, CLIENT_HEADER_NAME, CLIENT_KEYS = _load_config(CONFIG_PATH)
 N = len(CREDENTIALS)
-logger.info("Loaded %d upstream instance(s); auth header='%s'", N, HEADER_NAME)
+logger.info("Loaded %d upstream instance(s); upstream auth header='%s'; inbound header='%s'; %d client key(s)",
+            N, HEADER_NAME, CLIENT_HEADER_NAME, len(CLIENT_KEYS))
 
-# ---------- Proxy config ----------
+# ---------- Proxy + auth config ----------
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade"
@@ -80,12 +93,47 @@ RETRY_4XX = {401, 403, 404}
 ERROR_BODY_MAX_BYTES = int(os.getenv("ERROR_BODY_MAX_BYTES", "2048"))
 ERROR_HEADER_SNAPSHOT = ["content-type", "apim-request-id", "x-ms-request-id", "x-request-id"]
 
+# Inbound auth thresholds
+MAX_BAD_KEYS = int(os.getenv("MAX_BAD_KEYS", "5"))
+BLOCK_SECONDS = int(os.getenv("BLOCK_SECONDS", "300"))  # 5 minutes
+
 app = FastAPI()
 app.state.rr_pos = 0                 # start index for next request
 app.state.rr_lock = asyncio.Lock()   # protects rr_pos
 
+# Track consecutive bad keys + temporary blocks (in-memory).
+# For multi-worker deployments, use a shared store like Redis instead.
+app.state.auth_lock = asyncio.Lock()
+app.state.bad_key_counts = {}        # ip -> consecutive bad attempts
+app.state.blocked_until = {}         # ip -> unix_ts
+
 def _host(url: str) -> str:
     return urlparse(url).netloc or url
+
+async def _is_blocked(ip: str) -> bool:
+    now = time.time()
+    until = app.state.blocked_until.get(ip)
+    if until and now < until:
+        return True
+    if until and now >= until:
+        # unblock after expiry
+        app.state.blocked_until.pop(ip, None)
+        app.state.bad_key_counts.pop(ip, None)
+    return False
+
+def _unauthorized(req_id: str, msg: str = "Invalid API key"):
+    return JSONResponse(
+        status_code=401,
+        content={"error": "invalid_api_key", "detail": msg, "request_id": req_id},
+        headers={"x-request-id": req_id},
+    )
+
+def _blocked(req_id: str, retry_after: int):
+    return JSONResponse(
+        status_code=403,
+        content={"error": "ip_blocked", "detail": f"Too many invalid API keys. Blocked for {retry_after} seconds.", "request_id": req_id},
+        headers={"x-request-id": req_id, "retry-after": str(retry_after)},
+    )
 
 @app.middleware("http")
 async def proxy_middleware(request: Request, call_next):
@@ -94,8 +142,43 @@ async def proxy_middleware(request: Request, call_next):
     request_id_ctx_var.set(req_id)
 
     started = time.perf_counter()
+    client_ip = request.client.host if request.client else "-"
 
-    # Determine the attempt order for THIS request using the shared pointer.
+    # ---------- Inbound IP block check ----------
+    async with app.state.auth_lock:
+        if await _is_blocked(client_ip):
+            remaining = int(app.state.blocked_until[client_ip] - time.time())
+            remaining = max(1, remaining)
+            logger.warning("Blocked request from %s (remaining=%ss)", client_ip, remaining)
+            return _blocked(req_id, remaining)
+
+    # ---------- Inbound API key auth ----------
+    provided_key = request.headers.get(CLIENT_HEADER_NAME) or request.headers.get("api-key")
+    key_ok = (provided_key is not None) and ((len(CLIENT_KEYS) == 0) or (provided_key in CLIENT_KEYS))
+    # If you want to require at least one configured key, keep the check as above.
+    # If no keys configured should mean "deny all", replace with: key_ok = provided_key in CLIENT_KEYS
+
+    if not key_ok:
+        async with app.state.auth_lock:
+            # bump failure count
+            cnt = app.state.bad_key_counts.get(client_ip, 0) + 1
+            app.state.bad_key_counts[client_ip] = cnt
+
+            if cnt >= MAX_BAD_KEYS:
+                app.state.blocked_until[client_ip] = time.time() + BLOCK_SECONDS
+                app.state.bad_key_counts[client_ip] = 0  # reset after blocking
+                logger.warning("IP %s blocked for %ss after %d consecutive bad keys", client_ip, BLOCK_SECONDS, MAX_BAD_KEYS)
+                return _blocked(req_id, BLOCK_SECONDS)
+
+        logger.warning("Unauthorized request from %s (bad_key_count=%d)", client_ip, app.state.bad_key_counts.get(client_ip, 0))
+        return _unauthorized(req_id)
+
+    # Success: reset failure counter
+    async with app.state.auth_lock:
+        if client_ip in app.state.bad_key_counts:
+            app.state.bad_key_counts.pop(client_ip, None)
+
+    # ---------- Determine the attempt order for THIS request ----------
     async with request.app.state.rr_lock:
         start = request.app.state.rr_pos
     order_indices = [(start + off) % N for off in range(N)]
@@ -108,8 +191,9 @@ async def proxy_middleware(request: Request, call_next):
 
     base_headers = {k.lower(): v for k, v in request.headers.items()
                     if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
-    # scrub any inbound auth
+    # scrub any inbound auth (client key must not be forwarded)
     base_headers.pop("api-key", None)
+    base_headers.pop(CLIENT_HEADER_NAME, None)
     base_headers.pop("authorization", None)
 
     body = await request.body()
@@ -125,6 +209,7 @@ async def proxy_middleware(request: Request, call_next):
             t0 = time.perf_counter()
             target_url = f"{endpoint}{path_and_query}"
             headers = dict(base_headers)
+            # Upstream auth header
             headers[HEADER_NAME] = api_key
             headers.setdefault("x-request-id", req_id)
 
@@ -185,9 +270,6 @@ async def proxy_middleware(request: Request, call_next):
                         body_snippet = preview.decode("utf-8", "replace")
                     except Exception:
                         body_snippet = None
-                        # If you prefer base64 for binary, use:
-                        # import base64
-                        # body_snippet = "base64:" + base64.b64encode(preview).decode("ascii")
 
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 last_error = f"HTTP {status} from {endpoint}"
