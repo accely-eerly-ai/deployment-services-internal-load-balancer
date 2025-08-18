@@ -204,7 +204,9 @@ async def proxy_middleware(request: Request, call_next):
     attempts = []   # for final JSON on total failure
     last_error = None
 
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=None)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt_num, (abs_idx, (endpoint, api_key)) in enumerate(order, start=1):
             t0 = time.perf_counter()
             target_url = f"{endpoint}{path_and_query}"
