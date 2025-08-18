@@ -1,0 +1,18 @@
+import toml
+import re
+
+# Load the pyproject.toml file  
+with open('pyproject.toml', 'r') as file:  
+    pyproject = toml.load(file)  
+
+# Extract dependencies (assuming they're under the 'project' key)  
+dependencies = pyproject['project']['dependencies']  
+
+# Remove version constraints using regex
+clean_dependencies = [re.sub(r'\s*\(.*?\)', '', dep) for dep in dependencies]
+
+# Write the cleaned dependencies to requirements.txt  
+with open('requirements.txt', 'w') as req_file:  
+    req_file.write('\n'.join(clean_dependencies))
+
+print("requirements.txt has been created with dependencies without version constraints.")
