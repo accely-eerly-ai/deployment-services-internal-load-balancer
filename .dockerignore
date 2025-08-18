@@ -30,3 +30,7 @@ docker-compose.yml
 *.sublime-workspace
 *.sublime-project
 *.DS_Store
+
+# Project Files
+test.py
+azure_instances.json
