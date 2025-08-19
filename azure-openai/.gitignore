@@ -127,4 +127,3 @@ dmypy.json
 # Project Files
 test.py
 azure_instances.json
-tavily_instances.json

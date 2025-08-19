@@ -1,0 +1,36 @@
+# Ignore Python bytecode
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environments
+venv/
+env/
+
+# Ignore local development files
+*.env
+*.local
+
+# Ignore log files
+*.log
+
+# Ignore test directories and files
+tests/
+*.pytest_cache
+*.coverage
+
+# Ignore Docker files
+Dockerfile
+docker-compose.yml
+
+# Ignore other unnecessary files
+*.md
+*.json
+*.yaml
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.DS_Store
+
+# Project Files
+test.py
+azure_instances.json
