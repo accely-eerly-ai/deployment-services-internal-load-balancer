@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from starlette.responses import StreamingResponse, PlainTextResponse
+from starlette.responses import StreamingResponse, PlainTextResponse, Response
 from starlette.background import BackgroundTask
 from typing import List, Tuple
 from urllib.parse import urlparse
@@ -135,6 +135,18 @@ def _blocked(req_id: str, retry_after: int):
         headers={"x-request-id": req_id, "retry-after": str(retry_after)},
     )
 
+# ---- Safe streaming wrapper ----
+async def safe_aiter_raw(upstream, req_id: str):
+    try:
+        async for chunk in upstream.aiter_raw():
+            yield chunk
+    except httpx.ReadError as e:
+        logger.warning("Upstream stream closed early (req_id=%s): %s", req_id, e)
+    except httpx.HTTPError as e:
+        logger.warning("Upstream HTTP error during stream (req_id=%s): %s", req_id, e)
+    finally:
+        await upstream.aclose()
+
 @app.middleware("http")
 async def proxy_middleware(request: Request, call_next):
     # set/propagate a request id (8 hex for readability)
@@ -240,6 +252,11 @@ async def proxy_middleware(request: Request, call_next):
                 continue
 
             status = upstream.status_code
+            resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP}
+            resp_headers["x-request-id"] = req_id
+
+            data = await upstream.aread()
+            await upstream.aclose()
 
             # Retryable statuses (incl. 404 for missing deployment on that endpoint)
             if status in RETRY_STATUS or status in RETRY_4XX:
@@ -299,9 +316,12 @@ async def proxy_middleware(request: Request, call_next):
                 duration_ms = int((time.perf_counter() - started) * 1000)
                 logger.info("Returning non-retryable %d from %s (duration=%dms)",
                             status, _host(endpoint), duration_ms)
-                return StreamingResponse(
-                    upstream.aiter_raw(),
-                    background=BackgroundTask(upstream.aclose),
+                
+                content = await upstream.aread()
+                await upstream.aclose()
+                
+                return Response(
+                    content=content,
                     status_code=status,
                     headers=resp_headers,
                     media_type=upstream.headers.get("content-type"),
@@ -319,13 +339,8 @@ async def proxy_middleware(request: Request, call_next):
             logger.info("Success via %s (status=%d, duration=%dms). Next start=%d",
                         _host(endpoint), status, duration_ms, request.app.state.rr_pos)
 
-            return StreamingResponse(
-                upstream.aiter_raw(),
-                background=BackgroundTask(upstream.aclose),
-                status_code=status,
-                headers=resp_headers,
-                media_type=upstream.headers.get("content-type"),
-            )
+            return Response(content=data, status_code=status, headers=resp_headers,
+                            media_type=upstream.headers.get("content-type"))
 
     # ---- ALL FAILED: advance pointer by 1 so we don't keep starting at the same first
     async with request.app.state.rr_lock:
